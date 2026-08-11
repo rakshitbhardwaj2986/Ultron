@@ -363,6 +363,33 @@ ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")  # no longer used for s
 FINNHUB_API_KEY = (os.getenv("FINNHUB_API_KEY") or "").strip()
 
 
+import socket
+
+
+def _smtp_ssl_ipv4(host, port, timeout=15):
+    """smtplib.SMTP_SSL lets the OS pick which resolved address to connect
+    to, and on some cloud hosts (Render included) that can be an IPv6
+    address with no outbound route — producing '[Errno 101] Network is
+    unreachable' even though the host works fine locally. This temporarily
+    forces DNS resolution to IPv4-only for the duration of the connection,
+    while still connecting via the hostname itself (not a raw IP) so
+    Gmail's SSL certificate — issued for the hostname — still verifies
+    correctly."""
+    original_getaddrinfo = socket.getaddrinfo
+
+    def ipv4_only_getaddrinfo(*args, **kwargs):
+        return [
+            info for info in original_getaddrinfo(*args, **kwargs)
+            if info[0] == socket.AF_INET
+        ]
+
+    socket.getaddrinfo = ipv4_only_getaddrinfo
+    try:
+        return smtplib.SMTP_SSL(host, port, timeout=timeout)
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+
+
 def send_email(data):
     to = data.get("to")
     subject = data.get("subject") or "Message from Ultron"
@@ -378,7 +405,7 @@ def send_email(data):
         msg["Subject"] = subject
         msg.set_content(body)
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        with _smtp_ssl_ipv4("smtp.gmail.com", 465) as smtp:
             smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
             smtp.send_message(msg)
 
