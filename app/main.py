@@ -484,13 +484,14 @@ def handle_message(req: MessageRequest, db: Session = Depends(get_db)):
         response_text = ai_result.response
         action_data = ai_result.action_data or {}
 
-        if ai_result.requires_confirmation and intent in ("send_email", "get_weather", "get_stock"):
-            # don't run it yet — save the draft and wait for the next message
+        CONFIRMATION_REQUIRED_INTENTS = {"send_email"}
+        if intent in CONFIRMATION_REQUIRED_INTENTS:
             save_pending_action(db, req.user_id, intent, action_data, response_text)
             action_result = None
         else:
             action_result = execute_action(intent, action_data)
-
+    if action_result:
+        response_text = action_result
     # 2. Save to DB
     db_message = Message(
         user_id=req.user_id,
