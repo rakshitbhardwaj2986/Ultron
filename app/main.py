@@ -287,6 +287,9 @@ Rules:
   The "response" should summarize the draft and ask the user to confirm — do NOT say it was sent,
   it has not been sent yet.
 - For "get_weather" and "get_stock": requires_confirmation is false, these run immediately.
+- For "get_stock": "stock_name" MUST be the stock's ticker symbol (e.g. "NVDA" for Nvidia, "AAPL"
+  for Apple, "MSFT" for Microsoft, "GOOGL" for Google/Alphabet, "AMZN" for Amazon, "TSLA" for Tesla,
+  "META" for Meta), NOT the company's plain name — the stock lookup only accepts exact ticker symbols.
 - Use the conversation so far to fill in details the user gave earlier (e.g. a recipient or topic
   mentioned a few messages ago) if the current command doesn't repeat them.
 
@@ -406,11 +409,59 @@ def get_weather(data):
         return f"Couldn't fetch weather for {city}: {e}"
 
 
+# Safety net in case the LLM returns a plain company name instead of a
+# ticker despite the prompt instruction — covers the most commonly asked
+# companies without needing an extra API call for the typical case.
+COMMON_TICKERS = {
+    "nvidia": "NVDA", "apple": "AAPL", "microsoft": "MSFT",
+    "google": "GOOGL", "alphabet": "GOOGL", "amazon": "AMZN",
+    "tesla": "TSLA", "meta": "META", "facebook": "META",
+    "netflix": "NFLX", "amd": "AMD", "intel": "INTC"
+}
+
+
+def _resolve_ticker(stock: str) -> str:
+    """Best-effort: if this already looks like a ticker (short, no spaces,
+    all caps or already matches), use it as-is. Otherwise check the common
+    name map, and fall back to Alpha Vantage's own symbol search."""
+    cleaned = stock.strip()
+    lower = cleaned.lower()
+
+    if lower in COMMON_TICKERS:
+        return COMMON_TICKERS[lower]
+
+    # Looks like it's probably already a ticker (short, no spaces)
+    if len(cleaned) <= 5 and " " not in cleaned:
+        return cleaned.upper()
+
+    # Last resort: ask Alpha Vantage to search for the best-matching symbol
+    try:
+        response = requests.get(
+            "https://www.alphavantage.co/query",
+            params={
+                "function": "SYMBOL_SEARCH",
+                "keywords": cleaned,
+                "apikey": ALPHAVANTAGE_API_KEY
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        matches = response.json().get("bestMatches", [])
+        if matches:
+            return matches[0].get("1. symbol", cleaned)
+    except Exception:
+        pass
+
+    return cleaned
+
+
 def get_stock(data):
     stock = data.get("stock_name")
 
     if not stock:
         return "Couldn't get the stock price — no stock symbol was given."
+
+    stock = _resolve_ticker(stock)
 
     try:
         url = "https://www.alphavantage.co/query"
@@ -484,14 +535,27 @@ def handle_message(req: MessageRequest, db: Session = Depends(get_db)):
         response_text = ai_result.response
         action_data = ai_result.action_data or {}
 
+        # Only send_email actually needs confirmation before running — weather
+        # and stock lookups are read-only and safe to run immediately.
+        # Groq's own requires_confirmation field is unreliable (it sometimes
+        # sets it true for weather/stock too, despite the prompt telling it
+        # not to), so this is enforced here in code rather than trusted from
+        # the LLM's output.
         CONFIRMATION_REQUIRED_INTENTS = {"send_email"}
+
         if intent in CONFIRMATION_REQUIRED_INTENTS:
+            # don't run it yet — save the draft and wait for the next message
             save_pending_action(db, req.user_id, intent, action_data, response_text)
             action_result = None
         else:
             action_result = execute_action(intent, action_data)
-    if action_result:
-        response_text = action_result
+            if action_result:
+                # The frontend only displays `response`, not `action_result` —
+                # so for actions that run immediately (weather, stock), show
+                # the real fetched data instead of the LLM's generic preview
+                # text (e.g. "Let me check that for you").
+                response_text = action_result
+
     # 2. Save to DB
     db_message = Message(
         user_id=req.user_id,
