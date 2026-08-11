@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ultron Core</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000000;
+    overflow: hidden;
+  }
+  #ultron-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  #demo-btn {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 10px 20px;
+    background: rgba(30, 110, 220, 0.10);
+    border: 1px solid rgba(30, 110, 220, 0.5);
+    color: #4a9eff;
+    font-family: monospace;
+    font-size: 13px;
+    letter-spacing: 1px;
+    border-radius: 4px;
+    cursor: pointer;
+    user-select: none;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+  }
+
+  #demo-btn:active { background: rgba(30, 110, 220, 0.25); }
+
+  #demo-btn.hidden {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(-50%) translateY(8px);
+  }
+
+  #title-card {
+    position: fixed;
+    top: 8%;
+    left: 50%;
+    transform: translateX(-50%);
+    margin: 0;
+    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-weight: 200;
+    font-size: clamp(18px, 2.6vw, 30px);
+    letter-spacing: 0.5em;
+    padding-left: 0.5em;
+    color: #6fb3ff;
+    text-transform: uppercase;
+    text-align: center;
+    text-shadow:
+      0 0 6px rgba(30, 110, 220, 0.8),
+      0 0 16px rgba(20, 90, 200, 0.6),
+      0 0 36px rgba(15, 70, 180, 0.4);
+    user-select: none;
+    pointer-events: none;
+  }
+
+  /* RESPONSE TEXT */
+  #responseText {
+    position: fixed;
+    bottom: 90px;
+    width: 100%;
+    text-align: center;
+    color: #4a9eff;
+    font-family: monospace;
+    font-size: 14px;
+    letter-spacing: 1px;
+    opacity: 0.8;
+    pointer-events: none;
+    padding: 0 24px;
+    box-sizing: border-box;
+  }
+
+  #centerMessage {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    color: #6fb3ff;
+    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-size: clamp(18px, 2.8vw, 32px);
+    font-weight: 300;
+    letter-spacing: 0.08em;
+    padding: 24px;
+    box-sizing: border-box;
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(12px);
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    text-shadow: 0 0 12px rgba(30, 110, 220, 0.45);
+    z-index: 2;
+  }
+
+  #centerMessage.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+</style>
+</head>
+
+<body>
+
+<canvas id="ultron-canvas"></canvas>
+<h1 id="title-card">Ultron</h1>
+<button id="demo-btn">SAY "ULTRON"</button>
+<div id="centerMessage"></div>
+<div id="responseText">ULTRON ONLINE</div>
+
+<script>
+(function () {
+  const canvas = document.getElementById('ultron-canvas');
+  const ctx = canvas.getContext('2d');
+
+  const responseText = document.getElementById("responseText");
+  const centerMessage = document.getElementById("centerMessage");
+  const demoBtn = document.getElementById('demo-btn');
+
+  /* 🔊 TEXT TO SPEECH */
+  function speak(text) {
+    const speech = new SpeechSynthesisUtterance(text);
+    speech.rate = 1;
+    speech.pitch = 0.8;
+    speech.lang = "en-US";
+
+    if (recognition) recognition.stop();
+    setCenterMessage(text);
+    demoBtn.classList.add('hidden');
+
+    speech.onend = () => {
+      clearCenterMessage();
+      demoBtn.classList.remove('hidden');
+      if (recognition) recognition.start();
+    };
+
+    speechSynthesis.speak(speech);
+  }
+
+  function setCenterMessage(text) {
+    centerMessage.textContent = text;
+    centerMessage.classList.add('visible');
+  }
+
+  function clearCenterMessage() {
+    centerMessage.classList.remove('visible');
+    centerMessage.textContent = '';
+  }
+
+  let W, H, CX, CY;
+  let stars = [];
+
+  function generateStars() {
+    // denser, brighter field — deep space full of visible stars rather than a few faint ones
+    const density = 0.00028; // stars per pixel
+    const count = Math.floor(W * H * density);
+    stars = [];
+    for (let i = 0; i < count; i++) {
+      const isBright = Math.random() < 0.15; // a handful of standout "hero" stars
+      stars.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        r: isBright ? (Math.random() * 1.4 + 1.2) : (Math.random() * 1.0 + 0.4),
+        phase: Math.random() * Math.PI * 2,
+        speed: 0.3 + Math.random() * 0.8,
+        baseAlpha: isBright ? (0.75 + Math.random() * 0.25) : (0.45 + Math.random() * 0.4)
+      });
+    }
+  }
+
+  function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+    CX = W / 2;
+    CY = H / 2 + H * 0.06;
+    generateStars();
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  const NODE_COUNT = 380;
+  const SPHERE_RADIUS = Math.min(window.innerWidth, window.innerHeight) * 0.44;
+  const LINK_DIST = SPHERE_RADIUS * 0.62;
+  const BLUE = [30, 110, 220]; // darker, more saturated electric blue — was the lighter [70,170,255]
+
+  let state = 0;
+  let targetState = 0;
+
+  let rotationY = 0;
+  let breathePhase = 0;
+  let time = 0;
+
+  const nodes = [];
+  for (let i = 0; i < NODE_COUNT; i++) {
+    const y = 1 - (i / (NODE_COUNT - 1)) * 2;
+    const radiusAtY = Math.sqrt(1 - y * y);
+    const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+
+    nodes.push({
+      x0: Math.cos(theta) * radiusAtY,
+      y0: y,
+      z0: Math.sin(theta) * radiusAtY,
+      flickerPhase: Math.random() * Math.PI * 2,
+      flickerSpeed: 0.5 + Math.random() * 1.2,
+      pulseOffset: Math.random() * Math.PI * 2
+    });
+  }
+
+  const links = [];
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const dx = nodes[i].x0 - nodes[j].x0;
+      const dy = nodes[i].y0 - nodes[j].y0;
+      const dz = nodes[i].z0 - nodes[j].z0;
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d < (LINK_DIST / SPHERE_RADIUS)) {
+        links.push({ a: i, b: j, dist: d, energyPhase: Math.random() * Math.PI * 2 });
+      }
+    }
+  }
+
+  window.ultronActivate = function () { targetState = 1; };
+  window.ultronDeactivate = function () { targetState = 0; };
+
+  /* 🚀 SEND COMMAND TO BACKEND (shared by the manual button and the voice listener) */
+  async function sendCommandToUltron(userInput) {
+
+    if (!userInput) return;
+
+    responseText.innerText = "PROCESSING...";
+    setCenterMessage("PROCESSING...");
+    demoBtn.classList.add('hidden');
+    window.ultronActivate();
+
+    try {
+      const response = await fetch("/message", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          user_id: "1",
+          command: userInput   // ⚠️ backend's MessageRequest field is "command", not "message"
+        })
+      });
+
+      const data = await response.json();
+
+      responseText.innerText = data.response;
+      setCenterMessage(data.response);
+      speak(data.response);
+
+    } catch (err) {
+      const fallbackText = "ERROR CONNECTING TO CORE";
+      responseText.innerText = fallbackText;
+      setCenterMessage(fallbackText);
+      speak(fallbackText);
+    }
+
+    setTimeout(() => {
+      window.ultronDeactivate();
+    }, 1500);
+  }
+
+  /* 🚀 BACKEND CONNECTED BUTTON (manual fallback — type instead of speak) */
+  demoBtn.addEventListener('click', async () => {
+    const userInput = prompt("Speak to Ultron:");
+    sendCommandToUltron(userInput);
+  });
+
+  /* 🎙️ WAKE WORD + VOICE LISTENER
+     Say "Ultron" — the sphere activates and starts listening for your command.
+     Whatever you say next gets sent to the backend, spoken back in Ultron's
+     voice, and shown as text on screen. */
+  const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recognition = null;
+  let isListeningForCommand = false;
+  let recognitionActive = false;
+  const WAKE_WORD = "ultron";
+
+  function setStatus(message) {
+    responseText.innerText = message;
+  }
+
+  function startRecognition() {
+    if (recognitionActive) return; // avoid double-start "InvalidStateError" that silently kills recognition
+    try {
+      recognition.start();
+    } catch (err) {
+      console.warn("recognition.start() failed:", err);
+    }
+  }
+
+  if (SpeechRecognitionAPI) {
+    recognition = new SpeechRecognitionAPI();
+    recognition.continuous = true;
+    recognition.interimResults = true; // lets us show live "what it's hearing" for debugging
+    recognition.lang = "en-US";
+
+    recognition.onstart = () => {
+      recognitionActive = true;
+      setStatus("READY. SAY 'ULTRON'");
+    };
+
+    recognition.onaudiostart = () => {
+      console.log("Mic audio capture started — device is actually being read.");
+    };
+
+    recognition.onspeechstart = () => {
+      console.log("Speech detected in the audio stream.");
+    };
+
+    recognition.onresult = (event) => {
+      const result = event.results[event.results.length - 1];
+      const transcript = result[0].transcript.trim().toLowerCase();
+
+      if (!transcript) return;
+
+      if (!result.isFinal) {
+        // live debug view — proves audio IS reaching recognition, even before it's "final"
+        setStatus("HEARING: " + transcript);
+        return;
+      }
+
+      if (!isListeningForCommand) {
+        if (transcript.includes(WAKE_WORD)) {
+          isListeningForCommand = true;
+          setStatus("LISTENING...");
+          window.ultronActivate();
+          speak("I’m listening.");
+        } else {
+          setStatus("READY. SAY 'ULTRON' (last heard: \"" + transcript + "\")");
+        }
+        return;
+      }
+
+      isListeningForCommand = false;
+      sendCommandToUltron(transcript.replace(WAKE_WORD, "").trim());
+    };
+
+    recognition.onerror = (event) => {
+      console.error("Speech recognition error:", event.error);
+
+      // "no-speech" fires constantly during normal silence — not a real error,
+      // don't alarm the user with it. Only surface genuine problems.
+      if (event.error === "no-speech" || event.error === "aborted") {
+        return;
+      }
+
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        setStatus("MIC PERMISSION BLOCKED — check the site permission icon in the address bar");
+      } else if (event.error === "audio-capture") {
+        setStatus("NO MICROPHONE FOUND — check your device is selected in Windows sound settings");
+      } else if (event.error === "network") {
+        setStatus("NETWORK ERROR — speech recognition needs internet access to work");
+      } else {
+        setStatus("MIC ERROR: " + event.error);
+      }
+    };
+
+    recognition.onend = () => {
+      recognitionActive = false;
+      // small delay avoids a rapid stop/start loop if something keeps failing instantly
+      setTimeout(startRecognition, 300);
+    };
+
+    startRecognition();
+  } else {
+    setStatus("SPEECH RECOGNITION NOT SUPPORTED IN THIS BROWSER");
+  }
+
+  function frame() {
+    time += 1;
+
+    state += (targetState - state) * 0.04;
+
+    const rotSpeed   = 0.0022 + state * 0.004;
+    const breatheSpd = 0.02 + state * 0.05;
+    const breatheAmt = 0.03 + state * 0.09;
+    const flickerAmt = 0.35 + state * 0.65;
+    const glowStrength = 14 + state * 34;
+
+    rotationY += rotSpeed;
+    breathePhase += breatheSpd;
+
+    const scale = 1 + Math.sin(breathePhase) * breatheAmt;
+
+    ctx.clearRect(0, 0, W, H);
+
+    // starfield — drawn first so the sphere and text sit on top of it
+    for (const s of stars) {
+      const twinkle = 0.6 + 0.4 * Math.sin(time * 0.02 * s.speed + s.phase);
+      ctx.beginPath();
+      ctx.fillStyle = `rgba(255,255,255,${s.baseAlpha * twinkle})`;
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    const projected = nodes.map((n) => {
+      const cosR = Math.cos(rotationY), sinR = Math.sin(rotationY);
+      const x = n.x0 * cosR - n.z0 * sinR;
+      const z = n.x0 * sinR + n.z0 * cosR;
+      const y = n.y0;
+
+      const r = SPHERE_RADIUS * scale;
+      const perspective = 1 / (1.6 - z * 0.5);
+      const px = CX + x * r * perspective;
+      const py = CY + y * r * perspective;
+
+      const flicker = 0.5 + flickerAmt * (0.5 + 0.5 * Math.sin(time * 0.03 * n.flickerSpeed + n.flickerPhase));
+
+      return { px, py, z, flicker, perspective };
+    });
+
+    ctx.lineCap = 'round';
+    for (const link of links) {
+      const A = projected[link.a];
+      const B = projected[link.b];
+      const depthFade = (A.perspective + B.perspective) / 2.6;
+      const alpha = Math.max(0, 0.10 + depthFade * 0.22) * (0.5 + state * 0.5);
+
+      ctx.strokeStyle = `rgba(${BLUE[0]},${BLUE[1]},${BLUE[2]},${alpha})`;
+      ctx.lineWidth = 0.9;
+      ctx.beginPath();
+      ctx.moveTo(A.px, A.py);
+      ctx.lineTo(B.px, B.py);
+      ctx.stroke();
+    }
+
+    projected
+      .map((p, i) => ({ p, i }))
+      .sort((a, b) => a.p.z - b.p.z)
+      .forEach(({ p }) => {
+        const brightness = p.flicker;
+        const size = 1.1 + brightness * 1.6 * p.perspective;
+
+        ctx.beginPath();
+        ctx.fillStyle = `rgba(${30 + brightness * 110},${100 + brightness * 100},${220 + brightness * 35},${0.55 + brightness * 0.45})`;
+        ctx.shadowColor = `rgba(${BLUE[0]},${BLUE[1]},${BLUE[2]},0.9)`;
+        ctx.shadowBlur = glowStrength * brightness;
+        ctx.arc(p.px, p.py, size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      });
+
+    const coreGlow = ctx.createRadialGradient(CX, CY, 0, CX, CY, SPHERE_RADIUS * scale * 1.35);
+    coreGlow.addColorStop(0, `rgba(40,120,230,${0.14 + state * 0.16})`);
+    coreGlow.addColorStop(0.5, `rgba(30,110,220,${0.06 + state * 0.08})`);
+    coreGlow.addColorStop(1, 'rgba(30,110,220,0)');
+    ctx.fillStyle = coreGlow;
+    ctx.fillRect(0, 0, W, H);
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+
+</body>
+</html>
