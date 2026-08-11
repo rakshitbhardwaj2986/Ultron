@@ -357,7 +357,8 @@ User Command:
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")  # no longer used for stock lookups, kept in case you revert
+FINNHUB_API_KEY = (os.getenv("FINNHUB_API_KEY") or "").strip()
 
 
 def send_email(data):
@@ -421,9 +422,9 @@ COMMON_TICKERS = {
 
 
 def _resolve_ticker(stock: str) -> str:
-    """Best-effort: if this already looks like a ticker (short, no spaces,
-    all caps or already matches), use it as-is. Otherwise check the common
-    name map, and fall back to Alpha Vantage's own symbol search."""
+    """Best-effort: if this already looks like a ticker (short, no spaces),
+    use it as-is. Otherwise check the common name map, and fall back to
+    Finnhub's own symbol search."""
     cleaned = stock.strip()
     lower = cleaned.lower()
 
@@ -434,21 +435,17 @@ def _resolve_ticker(stock: str) -> str:
     if len(cleaned) <= 5 and " " not in cleaned:
         return cleaned.upper()
 
-    # Last resort: ask Alpha Vantage to search for the best-matching symbol
+    # Last resort: ask Finnhub to search for the best-matching symbol
     try:
         response = requests.get(
-            "https://www.alphavantage.co/query",
-            params={
-                "function": "SYMBOL_SEARCH",
-                "keywords": cleaned,
-                "apikey": ALPHAVANTAGE_API_KEY
-            },
+            "https://finnhub.io/api/v1/search",
+            params={"q": cleaned, "token": FINNHUB_API_KEY},
             timeout=10
         )
         response.raise_for_status()
-        matches = response.json().get("bestMatches", [])
+        matches = response.json().get("result", [])
         if matches:
-            return matches[0].get("1. symbol", cleaned)
+            return matches[0].get("symbol", cleaned)
     except Exception:
         pass
 
@@ -464,33 +461,20 @@ def get_stock(data):
     stock = _resolve_ticker(stock)
 
     try:
-        url = "https://www.alphavantage.co/query"
-        params = {
-            "function": "GLOBAL_QUOTE",
-            "symbol": stock,
-            "apikey": ALPHAVANTAGE_API_KEY
-        }
-
-        response = requests.get(url, params=params)
+        response = requests.get(
+            "https://finnhub.io/api/v1/quote",
+            params={"symbol": stock, "token": FINNHUB_API_KEY},
+            timeout=10
+        )
         response.raise_for_status()
         payload = response.json()
-        quote = payload.get("Global Quote", {})
-        price = quote.get("05. price")
+
+        # Finnhub returns 0 for every field (not an error) when the symbol
+        # doesn't exist or the request failed — that's the "no data" signal.
+        price = payload.get("c")
 
         if not price:
-            # Alpha Vantage returns a "Note" or "Information" field instead of
-            # "Global Quote" when the free-tier rate limit is hit, or an
-            # "Error Message" for an invalid symbol — surface whichever one
-            # is present instead of a generic message, so it's actually
-            # possible to tell what went wrong.
-            reason = (
-                payload.get("Information")
-                or payload.get("Note")
-                or payload.get("Error Message")
-            )
-            if reason:
-                return f"Couldn't fetch stock data for {stock}: {reason}"
-            return f"Couldn't find stock data for {stock} (unexpected response: {payload})"
+            return f"Couldn't find stock data for {stock}"
 
         return f"Stock price of {stock} is ${float(price):.2f}"
 
