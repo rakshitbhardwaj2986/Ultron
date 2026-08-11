@@ -363,31 +363,7 @@ ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")  # no longer used for s
 FINNHUB_API_KEY = (os.getenv("FINNHUB_API_KEY") or "").strip()
 
 
-import socket
-
-
-def _smtp_ssl_ipv4(host, port, timeout=15):
-    """smtplib.SMTP_SSL lets the OS pick which resolved address to connect
-    to, and on some cloud hosts (Render included) that can be an IPv6
-    address with no outbound route — producing '[Errno 101] Network is
-    unreachable' even though the host works fine locally. This temporarily
-    forces DNS resolution to IPv4-only for the duration of the connection,
-    while still connecting via the hostname itself (not a raw IP) so
-    Gmail's SSL certificate — issued for the hostname — still verifies
-    correctly."""
-    original_getaddrinfo = socket.getaddrinfo
-
-    def ipv4_only_getaddrinfo(*args, **kwargs):
-        return [
-            info for info in original_getaddrinfo(*args, **kwargs)
-            if info[0] == socket.AF_INET
-        ]
-
-    socket.getaddrinfo = ipv4_only_getaddrinfo
-    try:
-        return smtplib.SMTP_SSL(host, port, timeout=timeout)
-    finally:
-        socket.getaddrinfo = original_getaddrinfo
+LIVE_DEMO = (os.getenv("LIVE_DEMO") or "").strip().lower() == "true"
 
 
 def send_email(data):
@@ -398,6 +374,17 @@ def send_email(data):
     if not to:
         return "Couldn't send the email — no recipient was given."
 
+    if LIVE_DEMO:
+        # Set only on the public Render deployment (not locally). Avoids
+        # exposing an unauthenticated endpoint that can fire real emails to
+        # arbitrary addresses, and sidesteps outbound SMTP port blocks on
+        # free-tier hosts entirely.
+        return (
+            f"✅ Email drafted and would be sent to {to} — real sending is "
+            f"disabled in this public demo. Clone the repo and run it "
+            f"locally to enable real sending."
+        )
+
     try:
         msg = EmailMessage()
         msg["From"] = GMAIL_ADDRESS
@@ -405,7 +392,7 @@ def send_email(data):
         msg["Subject"] = subject
         msg.set_content(body)
 
-        with _smtp_ssl_ipv4("smtp.gmail.com", 465) as smtp:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
             smtp.send_message(msg)
 
