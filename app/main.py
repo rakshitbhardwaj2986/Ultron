@@ -290,6 +290,8 @@ Rules:
 - For "get_stock": "stock_name" MUST be the stock's ticker symbol (e.g. "NVDA" for Nvidia, "AAPL"
   for Apple, "MSFT" for Microsoft, "GOOGL" for Google/Alphabet, "AMZN" for Amazon, "TSLA" for Tesla,
   "META" for Meta), NOT the company's plain name — the stock lookup only accepts exact ticker symbols.
+  For Indian companies listed on the NSE, append ".NS" to the ticker (e.g. "RELIANCE.NS" for
+  Reliance, "TCS.NS" for Tata Consultancy Services, "INFY.NS" for Infosys).
 - Use the conversation so far to fill in details the user gave earlier (e.g. a recipient or topic
   mentioned a few messages ago) if the current command doesn't repeat them.
 
@@ -417,7 +419,19 @@ COMMON_TICKERS = {
     "nvidia": "NVDA", "apple": "AAPL", "microsoft": "MSFT",
     "google": "GOOGL", "alphabet": "GOOGL", "amazon": "AMZN",
     "tesla": "TSLA", "meta": "META", "facebook": "META",
-    "netflix": "NFLX", "amd": "AMD", "intel": "INTC"
+    "netflix": "NFLX", "amd": "AMD", "intel": "INTC",
+
+    # Indian companies (NSE) — Finnhub's free tier doesn't cover NSE/BSE,
+    # so these are routed to Yahoo Finance instead (see get_stock below).
+    "tcs": "TCS.NS", "tata consultancy": "TCS.NS", "tata consultancy services": "TCS.NS",
+    "infosys": "INFY.NS", "reliance": "RELIANCE.NS", "reliance industries": "RELIANCE.NS",
+    "hdfc bank": "HDFCBANK.NS", "hdfc": "HDFCBANK.NS", "icici bank": "ICICIBANK.NS",
+    "icici": "ICICIBANK.NS", "wipro": "WIPRO.NS", "tata motors": "TATAMOTORS.NS",
+    "itc": "ITC.NS", "state bank of india": "SBIN.NS", "sbi": "SBIN.NS",
+    "bharti airtel": "BHARTIARTL.NS", "airtel": "BHARTIARTL.NS",
+    "hindustan unilever": "HINDUNILVR.NS", "larsen": "LT.NS", "larsen and toubro": "LT.NS",
+    "maruti": "MARUTI.NS", "maruti suzuki": "MARUTI.NS", "bajaj finance": "BAJFINANCE.NS",
+    "adani enterprises": "ADANIENT.NS", "ntpc": "NTPC.NS"
 }
 
 
@@ -452,6 +466,33 @@ def _resolve_ticker(stock: str) -> str:
     return cleaned
 
 
+def _get_stock_yahoo(stock):
+    """Yahoo Finance's public chart endpoint — no API key needed, and covers
+    exchanges Finnhub's free tier doesn't (like NSE .NS / BSE .BO)."""
+    try:
+        response = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{stock}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
+        )
+        response.raise_for_status()
+        result = response.json().get("chart", {}).get("result")
+
+        if not result:
+            return f"Couldn't find stock data for {stock}"
+
+        price = result[0].get("meta", {}).get("regularMarketPrice")
+        currency = result[0].get("meta", {}).get("currency", "")
+
+        if not price:
+            return f"Couldn't find stock data for {stock}"
+
+        return f"Stock price of {stock} is {currency} {float(price):.2f}"
+
+    except Exception as e:
+        return f"Couldn't fetch stock price for {stock}: {e}"
+
+
 def get_stock(data):
     stock = data.get("stock_name")
 
@@ -459,6 +500,12 @@ def get_stock(data):
         return "Couldn't get the stock price — no stock symbol was given."
 
     stock = _resolve_ticker(stock)
+
+    # Finnhub's free tier only covers US exchanges — Indian tickers
+    # (already tagged .NS/.BO by COMMON_TICKERS, or typed that way directly)
+    # go to Yahoo Finance instead.
+    if stock.upper().endswith(".NS") or stock.upper().endswith(".BO"):
+        return _get_stock_yahoo(stock.upper())
 
     try:
         response = requests.get(
