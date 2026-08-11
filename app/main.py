@@ -473,11 +473,24 @@ def get_stock(data):
 
         response = requests.get(url, params=params)
         response.raise_for_status()
-        quote = response.json().get("Global Quote", {})
+        payload = response.json()
+        quote = payload.get("Global Quote", {})
         price = quote.get("05. price")
 
         if not price:
-            return f"Couldn't find stock data for {stock}"
+            # Alpha Vantage returns a "Note" or "Information" field instead of
+            # "Global Quote" when the free-tier rate limit is hit, or an
+            # "Error Message" for an invalid symbol — surface whichever one
+            # is present instead of a generic message, so it's actually
+            # possible to tell what went wrong.
+            reason = (
+                payload.get("Information")
+                or payload.get("Note")
+                or payload.get("Error Message")
+            )
+            if reason:
+                return f"Couldn't fetch stock data for {stock}: {reason}"
+            return f"Couldn't find stock data for {stock} (unexpected response: {payload})"
 
         return f"Stock price of {stock} is ${float(price):.2f}"
 
