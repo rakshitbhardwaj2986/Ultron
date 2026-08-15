@@ -359,7 +359,6 @@ User Command:
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")  # no longer used for stock lookups, kept in case you revert
 FINNHUB_API_KEY = (os.getenv("FINNHUB_API_KEY") or "").strip()
 
 
