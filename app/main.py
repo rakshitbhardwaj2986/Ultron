@@ -299,6 +299,13 @@ def _clean_json_response(raw: str) -> str:
 
 def detect_intent(command: str, history: str = "") -> AIResponse:
 
+    if _is_smalltalk(command):
+        return AIResponse(
+            intent="chat",
+            response="Hello! I’m here and ready to help.",
+            action_data={}
+        )
+
     if _looks_like_action_request(command):
         prompt = f"""
 You are Ultron, an AI assistant.

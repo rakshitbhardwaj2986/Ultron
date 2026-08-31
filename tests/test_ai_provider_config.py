@@ -18,6 +18,13 @@ class TestAIProviderConfig(unittest.TestCase):
         with patch.dict(os.environ, {"AI_PROVIDER": "", "GROQ_API_KEY": "", "RENDER": ""}, clear=True):
             self.assertEqual(main.get_ollama_base_url(), "http://localhost:11434")
 
+    @patch("app.main.call_ollama")
+    def test_smalltalk_requests_do_not_hit_ai(self, mock_call_ollama):
+        result = main.detect_intent("hello there")
+        self.assertEqual(result.intent, "chat")
+        self.assertIn("hello", result.response.lower())
+        mock_call_ollama.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
