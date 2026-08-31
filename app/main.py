@@ -40,17 +40,13 @@ def _extract_command(prompt: str) -> str:
 
 
 def _build_fallback_response(command: str) -> str:
+    """Used when both Groq and Ollama fail — returns PLAIN TEXT, not JSON.
+    The action-request path (which expects JSON) already handles plain-text
+    fallback gracefully via its own try/except below; returning JSON here
+    was the bug — it displayed the raw dict verbatim in normal chat replies."""
     if command:
-        response_text = f"I heard you say: {command}"
-    else:
-        response_text = "I’m online and ready to help."
-
-    return json.dumps({
-        "intent": "chat",
-        "response": response_text,
-        "action_data": {},
-        "requires_confirmation": False
-    })
+        return f"I heard you say: {command}. I'm having trouble reaching my AI service right now — try again in a moment."
+    return "I'm online, but having trouble reaching my AI service right now — try again in a moment."
 
 
 def call_ollama(prompt: str, system_prompt: str = "You are a helpful assistant.") -> str:
@@ -359,6 +355,7 @@ User Command:
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")  # no longer used for stock lookups, kept in case you revert
 FINNHUB_API_KEY = (os.getenv("FINNHUB_API_KEY") or "").strip()
 
 
