@@ -26,8 +26,46 @@ def serve_ui():
 Base.metadata.create_all(bind=engine)
 
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
-AI_PROVIDER = (os.getenv("AI_PROVIDER") or ("groq" if GROQ_API_KEY else "ollama")).strip().lower()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+
+def is_deployed_environment() -> bool:
+    """Detect common hosted environments where localhost AI services are unavailable."""
+    hosted_markers = (
+        "RENDER",
+        "HEROKU",
+        "RAILWAY",
+        "VERCEL",
+        "NETLIFY",
+        "KOYEB",
+        "GCP",
+        "AWS",
+        "AZURE",
+        "DOCKER",
+    )
+    return any(os.getenv(name) for name in hosted_markers) or os.getenv("LIVE_DEMO", "").strip().lower() == "true"
+
+
+def resolve_ai_provider() -> str:
+    """Prefer explicit override, otherwise choose Groq when available and only use local Ollama in local development."""
+    configured = (os.getenv("AI_PROVIDER") or "").strip().lower()
+    if configured in {"groq", "ollama"}:
+        return configured
+    if GROQ_API_KEY:
+        return "groq"
+    if not is_deployed_environment():
+        return "ollama"
+    return "groq" if GROQ_API_KEY else "unavailable"
+
+
+def get_ollama_base_url() -> str:
+    """Only permit local Ollama fallback in local dev. Production hosts should never use localhost."""
+    if is_deployed_environment():
+        return ""
+    return "http://localhost:11434"
+
+
+AI_PROVIDER = resolve_ai_provider()
 
 
 def _extract_command(prompt: str) -> str:
@@ -50,10 +88,12 @@ def _build_fallback_response(command: str) -> str:
 
 
 def call_ollama(prompt: str, system_prompt: str = "You are a helpful assistant.") -> str:
-    """Route requests to Groq when configured, otherwise fall back to local Ollama or a simple response."""
+    """Route requests to Groq when configured, otherwise fall back to local Ollama only in local development."""
 
     try:
-        if AI_PROVIDER == "groq":
+        provider = resolve_ai_provider()
+
+        if provider == "groq":
             if not GROQ_API_KEY:
                 raise RuntimeError("GROQ_API_KEY is missing")
 
@@ -77,8 +117,11 @@ def call_ollama(prompt: str, system_prompt: str = "You are a helpful assistant."
             data = response.json()
             return data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-        # default: local Ollama
-        url = "http://localhost:11434/api/generate"
+        ollama_base_url = get_ollama_base_url()
+        if not ollama_base_url:
+            raise RuntimeError("Local Ollama fallback is disabled in deployed environments")
+
+        url = f"{ollama_base_url}/api/generate"
         payload = {
             "model": "llama3",
             "prompt": prompt,
