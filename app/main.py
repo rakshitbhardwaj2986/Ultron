@@ -142,6 +142,68 @@ def _looks_like_action_request(command: str) -> bool:
     return any(keyword in text for keyword in action_keywords)
 
 
+def _extract_email_address(command: str) -> str:
+    match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", command)
+    return match.group(0) if match else ""
+
+
+def _extract_city_from_weather(command: str) -> str:
+    text = command.strip()
+    patterns = [
+        r"(?:weather|forecast)\s+(?:in|at|for)\s+(.+)",
+        r"(?:in|at|for)\s+([A-Z][A-Za-z\s-]+?)\s*(?:\?|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            city = match.group(1).strip().strip("?.,! ")
+            if city:
+                return city
+    return ""
+
+
+def _extract_stock_symbol(command: str) -> str:
+    text = command.strip()
+    for pattern in [
+        r"(?:stock|ticker|share|price|quote)\s+(?:of|for)\s+([A-Za-z0-9.\-]+)",
+        r"(?:stock|ticker|share|price|quote)\s+([A-Za-z0-9.\-]+)",
+        r"([A-Z]{1,5}(?:\.NS|\.BO)?)\b",
+    ]:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            symbol = match.group(1).strip().strip("?.,! ")
+            if symbol and not symbol.lower() in {"price", "quote", "stock", "ticker"}:
+                return symbol
+    return ""
+
+
+def classify_action_request(command: str):
+    """Return (intent, action_data) for explicit command types without relying on the model."""
+    lower = command.lower().strip()
+    if not lower:
+        return None
+
+    email_match = _extract_email_address(command)
+    if "email" in lower or "mail" in lower:
+        if email_match:
+            subject = ""
+            body = command
+            if email_match in body:
+                body = body.replace(email_match, "").strip(" ,;:-")
+            subject = "Email from ULTRON" if not subject else subject
+            return "send_email", {"to": email_match, "subject": subject, "body": body}
+
+    weather_city = _extract_city_from_weather(command)
+    if "weather" in lower or "forecast" in lower:
+        return "get_weather", {"city": weather_city or ""}
+
+    stock_symbol = _extract_stock_symbol(command)
+    if "stock" in lower or "price" in lower or "quote" in lower:
+        return "get_stock", {"stock_name": stock_symbol or ""}
+
+    return None
+
+
 # CONVERSATION MEMORY
 
 def get_recent_history(db: Session, user_id: str, limit: int = 6) -> str:
@@ -304,6 +366,19 @@ def detect_intent(command: str, history: str = "") -> AIResponse:
             intent="chat",
             response="Hello! I’m here and ready to help.",
             action_data={}
+        )
+
+    explicit_action = classify_action_request(command)
+    if explicit_action:
+        intent, action_data = explicit_action
+        response = "Let me check that for you."
+        if intent == "send_email":
+            response = "I can draft that email for you. Please confirm if you want me to send it."
+        return AIResponse(
+            intent=intent,
+            response=response,
+            action_data=action_data,
+            requires_confirmation=(intent == "send_email")
         )
 
     if _looks_like_action_request(command):
@@ -633,32 +708,49 @@ def handle_message(req: MessageRequest, db: Session = Depends(get_db)):
 
     # 1b. Normal message (or the pending draft was just dropped above)
     if not pending:
-        history = get_recent_history(db, req.user_id)
-        ai_result = detect_intent(req.command, history)
-        intent = ai_result.intent
-        response_text = ai_result.response
-        action_data = ai_result.action_data or {}
+        explicit_action = classify_action_request(req.command)
+        if explicit_action:
+            intent, action_data = explicit_action
+            response_text = "Let me check that for you."
+            if intent == "send_email":
+                response_text = "I can draft that email for you. Please confirm if you want me to send it."
 
-        # Only send_email actually needs confirmation before running — weather
-        # and stock lookups are read-only and safe to run immediately.
-        # Groq's own requires_confirmation field is unreliable (it sometimes
-        # sets it true for weather/stock too, despite the prompt telling it
-        # not to), so this is enforced here in code rather than trusted from
-        # the LLM's output.
-        CONFIRMATION_REQUIRED_INTENTS = {"send_email"}
+            CONFIRMATION_REQUIRED_INTENTS = {"send_email"}
 
-        if intent in CONFIRMATION_REQUIRED_INTENTS:
-            # don't run it yet — save the draft and wait for the next message
-            save_pending_action(db, req.user_id, intent, action_data, response_text)
-            action_result = None
+            if intent in CONFIRMATION_REQUIRED_INTENTS:
+                save_pending_action(db, req.user_id, intent, action_data, response_text)
+                action_result = None
+            else:
+                action_result = execute_action(intent, action_data)
+                if action_result:
+                    response_text = action_result
         else:
-            action_result = execute_action(intent, action_data)
-            if action_result:
-                # The frontend only displays `response`, not `action_result` —
-                # so for actions that run immediately (weather, stock), show
-                # the real fetched data instead of the LLM's generic preview
-                # text (e.g. "Let me check that for you").
-                response_text = action_result
+            history = get_recent_history(db, req.user_id)
+            ai_result = detect_intent(req.command, history)
+            intent = ai_result.intent
+            response_text = ai_result.response
+            action_data = ai_result.action_data or {}
+
+            # Only send_email actually needs confirmation before running — weather
+            # and stock lookups are read-only and safe to run immediately.
+            # Groq's own requires_confirmation field is unreliable (it sometimes
+            # sets it true for weather/stock too, despite the prompt telling it
+            # not to), so this is enforced here in code rather than trusted from
+            # the LLM's output.
+            CONFIRMATION_REQUIRED_INTENTS = {"send_email"}
+
+            if intent in CONFIRMATION_REQUIRED_INTENTS:
+                # don't run it yet — save the draft and wait for the next message
+                save_pending_action(db, req.user_id, intent, action_data, response_text)
+                action_result = None
+            else:
+                action_result = execute_action(intent, action_data)
+                if action_result:
+                    # The frontend only displays `response`, not `action_result` —
+                    # so for actions that run immediately (weather, stock), show
+                    # the real fetched data instead of the LLM's generic preview
+                    # text (e.g. "Let me check that for you").
+                    response_text = action_result
 
     # 2. Save to DB
     db_message = Message(
