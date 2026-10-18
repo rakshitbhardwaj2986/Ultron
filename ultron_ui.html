@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ultron Core</title>
 <style>
   html, body {
@@ -128,24 +129,100 @@
   const centerMessage = document.getElementById("centerMessage");
   const demoBtn = document.getElementById('demo-btn');
 
+  /* 🆔 PER-BROWSER USER ID
+     Each visitor gets their own ID, saved in this browser. Conversation memory
+     and pending email drafts are stored per user_id on the backend, so a shared
+     hardcoded ID would mix every visitor's conversations together. */
+  function getUserId() {
+    try {
+      let id = localStorage.getItem("ultron_user_id");
+      if (!id) {
+        id = "user_" + Math.random().toString(36).slice(2, 12);
+        localStorage.setItem("ultron_user_id", id);
+      }
+      return id;
+    } catch (err) {
+      // localStorage blocked (private mode etc.) — fall back to a per-tab ID
+      return "user_" + Math.random().toString(36).slice(2, 12);
+    }
+  }
+  const USER_ID = getUserId();
+
+  /* 🧹 helpers for long / markdown-heavy answers */
+  function cleanForSpeech(text) {
+    return String(text || "")
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/[*_`#>|]/g, "")
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      .replace(/https?:\/\/\S+/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  // Chrome's speech engine can stall on very long text, so only speak the first
+  // few sentences aloud (the full text is still shown on screen).
+  function trimForSpeech(text, maxChars = 450) {
+    if (text.length <= maxChars) return text;
+    const cut = text.slice(0, maxChars);
+    const lastStop = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("? "), cut.lastIndexOf("! "));
+    return lastStop > 120 ? cut.slice(0, lastStop + 1) : cut;
+  }
+
+  function shortForDisplay(text, maxChars = 320) {
+    const t = String(text || "").trim();
+    return t.length > maxChars ? t.slice(0, maxChars).trim() + "…" : t;
+  }
+
   /* 🔊 TEXT TO SPEECH */
+  let isSpeaking = false;
+
   function speak(text) {
-    const speech = new SpeechSynthesisUtterance(text);
+    const display = shortForDisplay(text);
+    const spoken = trimForSpeech(cleanForSpeech(text));
+
+    setCenterMessage(display);
+    demoBtn.classList.add('hidden');
+
+    if (!spoken) {
+      finishSpeaking();
+      return;
+    }
+
+    // stop listening while Ultron talks, so it doesn't hear and react to its own voice
+    isSpeaking = true;
+    if (recognition) {
+      try { recognition.stop(); } catch (e) {}
+    }
+
+    speechSynthesis.cancel();
+
+    const speech = new SpeechSynthesisUtterance(spoken);
     speech.rate = 1;
     speech.pitch = 0.8;
     speech.lang = "en-US";
 
-    if (recognition) recognition.stop();
-    setCenterMessage(text);
-    demoBtn.classList.add('hidden');
-
-    speech.onend = () => {
-      clearCenterMessage();
-      demoBtn.classList.remove('hidden');
-      if (recognition) recognition.start();
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(watchdog);
+      finishSpeaking();
     };
 
+    speech.onend = done;
+    speech.onerror = done;
+
+    // safety net: if the browser never fires onend, don't leave the mic off forever
+    const watchdog = setTimeout(done, Math.min(60000, spoken.length * 110 + 4000));
+
     speechSynthesis.speak(speech);
+  }
+
+  function finishSpeaking() {
+    isSpeaking = false;
+    clearCenterMessage();
+    demoBtn.classList.remove('hidden');
+    startRecognition();
   }
 
   function setCenterMessage(text) {
@@ -192,7 +269,7 @@
   const NODE_COUNT = 380;
   const SPHERE_RADIUS = Math.min(window.innerWidth, window.innerHeight) * 0.44;
   const LINK_DIST = SPHERE_RADIUS * 0.62;
-  const BLUE = [30, 110, 220]; // darker, more saturated electric blue — was the lighter [70,170,255]
+  const BLUE = [30, 110, 220]; // darker, more saturated electric blue
 
   let state = 0;
   let targetState = 0;
@@ -236,7 +313,10 @@
   /* 🚀 SEND COMMAND TO BACKEND (shared by the manual button and the voice listener) */
   async function sendCommandToUltron(userInput) {
 
-    if (!userInput) return;
+    if (!userInput) {
+      startRecognition();
+      return;
+    }
 
     responseText.innerText = "PROCESSING...";
     setCenterMessage("PROCESSING...");
@@ -250,21 +330,25 @@
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          user_id: "1",
-          command: userInput   // ⚠️ backend's MessageRequest field is "command", not "message"
+          user_id: USER_ID,
+          command: userInput   // backend's MessageRequest field is "command", not "message"
         })
       });
 
-      const data = await response.json();
+      if (!response.ok) {
+        throw new Error("Server returned " + response.status);
+      }
 
-      responseText.innerText = data.response;
-      setCenterMessage(data.response);
-      speak(data.response);
+      const data = await response.json();
+      const reply = data.response || "I didn't get a response. Please try again.";
+
+      responseText.innerText = shortForDisplay(reply);
+      speak(reply);
 
     } catch (err) {
+      console.error("Request to Ultron failed:", err);
       const fallbackText = "ERROR CONNECTING TO CORE";
       responseText.innerText = fallbackText;
-      setCenterMessage(fallbackText);
       speak(fallbackText);
     }
 
@@ -281,7 +365,8 @@
 
   /* 🎙️ WAKE WORD + VOICE LISTENER
      Say "Ultron" — the sphere activates and starts listening for your command.
-     Whatever you say next gets sent to the backend, spoken back in Ultron's
+     You can also say it in one breath ("Ultron, what's the weather in Delhi").
+     Whatever you say gets sent to the backend, spoken back in Ultron's
      voice, and shown as text on screen. */
   const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
   let recognition = null;
@@ -294,7 +379,7 @@
   }
 
   function startRecognition() {
-    if (recognitionActive) return; // avoid double-start "InvalidStateError" that silently kills recognition
+    if (!recognition || recognitionActive || isSpeaking) return; // avoid double-start errors and self-listening
     try {
       recognition.start();
     } catch (err) {
@@ -310,7 +395,7 @@
 
     recognition.onstart = () => {
       recognitionActive = true;
-      setStatus("READY. SAY 'ULTRON'");
+      setStatus(isListeningForCommand ? "LISTENING..." : "READY. SAY 'ULTRON'");
     };
 
     recognition.onaudiostart = () => {
@@ -322,6 +407,8 @@
     };
 
     recognition.onresult = (event) => {
+      if (isSpeaking) return;
+
       const result = event.results[event.results.length - 1];
       const transcript = result[0].transcript.trim().toLowerCase();
 
@@ -335,10 +422,19 @@
 
       if (!isListeningForCommand) {
         if (transcript.includes(WAKE_WORD)) {
-          isListeningForCommand = true;
-          setStatus("LISTENING...");
+          // everything said after the wake word, if anything
+          const afterWake = transcript.split(WAKE_WORD).slice(1).join(" ").replace(/^[\s,.:;!?-]+/, "").trim();
+
           window.ultronActivate();
-          speak("I’m listening.");
+
+          if (afterWake.split(/\s+/).filter(Boolean).length >= 2) {
+            // "Ultron, what's the weather in Delhi" — run the command straight away
+            sendCommandToUltron(afterWake);
+          } else {
+            isListeningForCommand = true;
+            setStatus("LISTENING...");
+            speak("I’m listening.");
+          }
         } else {
           setStatus("READY. SAY 'ULTRON' (last heard: \"" + transcript + "\")");
         }
@@ -371,13 +467,16 @@
 
     recognition.onend = () => {
       recognitionActive = false;
+      // don't restart while Ultron is speaking — finishSpeaking() restarts it afterwards.
       // small delay avoids a rapid stop/start loop if something keeps failing instantly
-      setTimeout(startRecognition, 300);
+      if (!isSpeaking) {
+        setTimeout(startRecognition, 300);
+      }
     };
 
     startRecognition();
   } else {
-    setStatus("SPEECH RECOGNITION NOT SUPPORTED IN THIS BROWSER");
+    setStatus("SPEECH RECOGNITION NOT SUPPORTED IN THIS BROWSER — use the button below to type");
   }
 
   function frame() {
