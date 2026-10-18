@@ -22,11 +22,26 @@ app = FastAPI()
 def serve_ui():
     return FileResponse("ultron_ui.html")
 
+
+# HEALTH CHECK (use this with an uptime pinger to avoid Render cold starts)
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 # DATABASE SETUP
 Base.metadata.create_all(bind=engine)
 
-GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip().strip('"').strip("'")
+GROQ_MODEL = (os.getenv("GROQ_MODEL") or "llama-3.3-70b-versatile").strip().strip('"').strip("'")
+
+# If the main model fails (rate limit, retired model, etc.), try these in order.
+# Groq rate limits are per-model, so a smaller model often still works when the 70B is capped.
+GROQ_FALLBACK_MODELS = [
+    GROQ_MODEL,
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+]
 
 
 def is_deployed_environment() -> bool:
@@ -55,7 +70,7 @@ def resolve_ai_provider() -> str:
         return "groq"
     if not is_deployed_environment():
         return "ollama"
-    return "groq" if GROQ_API_KEY else "unavailable"
+    return "unavailable"
 
 
 def get_ollama_base_url() -> str:
@@ -66,6 +81,16 @@ def get_ollama_base_url() -> str:
 
 
 AI_PROVIDER = resolve_ai_provider()
+
+TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip().strip('"').strip("'")
+
+# Shows up once in the Render logs at startup — tells you instantly if keys are missing.
+print(
+    f"[STARTUP] provider={AI_PROVIDER} model={GROQ_MODEL} "
+    f"groq_key_set={bool(GROQ_API_KEY)} tavily_key_set={bool(TAVILY_API_KEY)} "
+    f"deployed={is_deployed_environment()}",
+    flush=True,
+)
 
 
 def _extract_command(prompt: str) -> str:
@@ -87,39 +112,81 @@ def _build_fallback_response(command: str) -> str:
     return "I'm online, but having trouble reaching my AI service right now — try again in a moment."
 
 
+def _call_groq(prompt: str, system_prompt: str) -> str:
+    """Calls Groq, trying each model in GROQ_FALLBACK_MODELS until one works.
+    Every failure is printed to the logs so it's visible in Render."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is missing — set it in Render > Environment")
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    last_error = None
+    tried = set()
+
+    for model in GROQ_FALLBACK_MODELS:
+        if not model or model in tried:
+            continue
+        tried.add(model)
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 600
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+
+            if response.status_code != 200:
+                print(
+                    f"[GROQ ERROR] model={model} status={response.status_code} body={response.text[:300]}",
+                    flush=True,
+                )
+                # 401 = bad key: no point trying other models
+                if response.status_code == 401:
+                    raise RuntimeError("Groq rejected the API key (401) — check GROQ_API_KEY in Render")
+                last_error = RuntimeError(f"Groq {response.status_code} on {model}")
+                continue
+
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if content:
+                if model != GROQ_MODEL:
+                    print(f"[GROQ] primary model failed, answered using fallback model={model}", flush=True)
+                return content
+
+            last_error = RuntimeError(f"Empty response from {model}")
+
+        except requests.exceptions.RequestException as e:
+            print(f"[GROQ ERROR] model={model} {type(e).__name__}: {e}", flush=True)
+            last_error = e
+            continue
+
+    raise last_error or RuntimeError("All Groq models failed")
+
+
 def call_ollama(prompt: str, system_prompt: str = "You are a helpful assistant.") -> str:
     """Route requests to Groq when configured, otherwise fall back to local Ollama only in local development."""
 
+    provider = resolve_ai_provider()
+
     try:
-        provider = resolve_ai_provider()
-
         if provider == "groq":
-            if not GROQ_API_KEY:
-                raise RuntimeError("GROQ_API_KEY is missing")
-
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.2,
-                "max_tokens": 300
-            }
-
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return _call_groq(prompt, system_prompt)
 
         ollama_base_url = get_ollama_base_url()
         if not ollama_base_url:
-            raise RuntimeError("Local Ollama fallback is disabled in deployed environments")
+            raise RuntimeError(
+                "No AI provider available: GROQ_API_KEY is not set and local Ollama is disabled on hosted environments"
+            )
 
         url = f"{ollama_base_url}/api/generate"
         payload = {
@@ -131,7 +198,9 @@ def call_ollama(prompt: str, system_prompt: str = "You are a helpful assistant."
         response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
         return response.json()["response"]
-    except Exception:
+
+    except Exception as e:
+        print(f"[LLM ERROR] provider={provider} {type(e).__name__}: {e}", flush=True)
         return _build_fallback_response(_extract_command(prompt))
 
 # INTENT DETECTION
@@ -286,9 +355,6 @@ def _is_smalltalk(command: str) -> bool:
     return any(text == phrase or text.startswith(phrase + " ") for phrase in smalltalk_phrases)
 
 
-TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip()
-
-
 def fetch_web_context(query: str, max_results: int = 5) -> str:
     """Real web search grounding via Tavily — built for feeding results to
     an LLM (returns actual page content, not just headlines). Falls back to
@@ -298,6 +364,7 @@ def fetch_web_context(query: str, max_results: int = 5) -> str:
         try:
             response = requests.post(
                 "https://api.tavily.com/search",
+                headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
                 json={
                     "api_key": TAVILY_API_KEY,
                     "query": query,
@@ -306,7 +373,11 @@ def fetch_web_context(query: str, max_results: int = 5) -> str:
                 },
                 timeout=20
             )
-            response.raise_for_status()
+
+            if response.status_code != 200:
+                print(f"[TAVILY ERROR] status={response.status_code} body={response.text[:300]}", flush=True)
+                response.raise_for_status()
+
             results = response.json().get("results", [])
 
             snippets = []
@@ -319,8 +390,10 @@ def fetch_web_context(query: str, max_results: int = 5) -> str:
 
             if snippets:
                 return "Web search results:\n\n" + "\n\n".join(snippets)
-        except Exception:
-            pass  # fall through to the RSS fallback below
+        except Exception as e:
+            print(f"[TAVILY ERROR] {type(e).__name__}: {e} — falling back to Google News RSS", flush=True)
+    else:
+        print("[TAVILY] TAVILY_API_KEY not set — using Google News RSS fallback", flush=True)
 
     # fallback: Google News RSS — narrower (news only), needs no API key
     try:
@@ -343,7 +416,8 @@ def fetch_web_context(query: str, max_results: int = 5) -> str:
             return ""
 
         return "Search results:\n" + "\n".join(snippets[:max_results])
-    except Exception:
+    except Exception as e:
+        print(f"[RSS ERROR] {type(e).__name__}: {e}", flush=True)
         return ""
 
 
@@ -533,7 +607,7 @@ def get_weather(data):
         url = "https://api.openweathermap.org/data/2.5/weather"
         params = {"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric"}
 
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         result = response.json()
 
