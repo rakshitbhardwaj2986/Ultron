@@ -6,6 +6,7 @@ import json
 import os
 import smtplib
 import re
+import time
 from typing import Optional
 from bs4 import BeautifulSoup
 from email.message import EmailMessage
@@ -23,7 +24,7 @@ def serve_ui():
     return FileResponse("ultron_ui.html")
 
 
-# HEALTH CHECK (use this with an uptime pinger to avoid Render cold starts)
+# HEALTH CHECK (point an uptime pinger at this to avoid Render cold starts)
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -33,15 +34,8 @@ def health():
 Base.metadata.create_all(bind=engine)
 
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip().strip('"').strip("'")
-GROQ_MODEL = (os.getenv("GROQ_MODEL") or "llama-3.3-70b-versatile").strip().strip('"').strip("'")
-
-# If the main model fails (rate limit, retired model, etc.), try these in order.
-# Groq rate limits are per-model, so a smaller model often still works when the 70B is capped.
-GROQ_FALLBACK_MODELS = [
-    GROQ_MODEL,
-    "openai/gpt-oss-20b",
-    "qwen/qwen3.8-27b",
-]
+GROQ_MODEL = (os.getenv("GROQ_MODEL") or "openai/gpt-oss-120b").strip().strip('"').strip("'")
+TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip().strip('"').strip("'")
 
 
 def is_deployed_environment() -> bool:
@@ -82,8 +76,6 @@ def get_ollama_base_url() -> str:
 
 AI_PROVIDER = resolve_ai_provider()
 
-TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip().strip('"').strip("'")
-
 # Shows up once in the Render logs at startup — tells you instantly if keys are missing.
 print(
     f"[STARTUP] provider={AI_PROVIDER} model={GROQ_MODEL} "
@@ -103,7 +95,7 @@ def _extract_command(prompt: str) -> str:
 
 
 def _build_fallback_response(command: str) -> str:
-    """Used when both Groq and Ollama fail — returns PLAIN TEXT, not JSON.
+    """Used when every AI provider fails — returns PLAIN TEXT, not JSON.
     The action-request path (which expects JSON) already handles plain-text
     fallback gracefully via its own try/except below; returning JSON here
     was the bug — it displayed the raw dict verbatim in normal chat replies."""
@@ -112,26 +104,48 @@ def _build_fallback_response(command: str) -> str:
     return "I'm online, but having trouble reaching my AI service right now — try again in a moment."
 
 
+# GROQ (with automatic model discovery, so a retired model never takes Ultron down)
+
+_MODEL_CACHE = {"models": [], "time": 0}
+_SKIP_WORDS = ("whisper", "guard", "tts", "playai", "orpheus", "embed", "safeguard", "allam")
+_PREFER_WORDS = ("gpt-oss", "llama", "qwen", "kimi")
+
+
+def _discover_groq_models() -> list:
+    """Ask Groq which chat models this key can use right now (cached for 10 min)."""
+    if _MODEL_CACHE["models"] and time.time() - _MODEL_CACHE["time"] < 600:
+        return _MODEL_CACHE["models"]
+    try:
+        r = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        ids = [m["id"] for m in r.json().get("data", []) if m.get("active", True)]
+        ids = [i for i in ids if not any(w in i.lower() for w in _SKIP_WORDS)]
+        ids.sort(key=lambda i: 0 if any(w in i.lower() for w in _PREFER_WORDS) else 1)
+        print(f"[GROQ] available chat models: {ids}", flush=True)
+        _MODEL_CACHE.update(models=ids, time=time.time())
+        return ids
+    except Exception as e:
+        print(f"[GROQ ERROR] couldn't list models: {type(e).__name__}: {e}", flush=True)
+        return []
+
+
 def _call_groq(prompt: str, system_prompt: str) -> str:
-    """Calls Groq, trying each model in GROQ_FALLBACK_MODELS until one works.
+    """Tries GROQ_MODEL first, then other models available on the key.
     Every failure is printed to the logs so it's visible in Render."""
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is missing — set it in Render > Environment")
 
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
     last_error = None
-    tried = set()
+    tried = []
 
-    for model in GROQ_FALLBACK_MODELS:
-        if not model or model in tried:
-            continue
-        tried.add(model)
-
+    def attempt(model: str):
         payload = {
             "model": model,
             "messages": [
@@ -139,44 +153,55 @@ def _call_groq(prompt: str, system_prompt: str) -> str:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
+            # reasoning models (gpt-oss) spend part of this budget "thinking", so keep it generous
             "max_tokens": 2000,
         }
         if "gpt-oss" in model:
             payload["reasoning_effort"] = "low"
 
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        if response.status_code != 200:
+            print(f"[GROQ ERROR] model={model} status={response.status_code} body={response.text[:200]}", flush=True)
+            if response.status_code == 401:
+                raise PermissionError("Groq rejected the API key (401) — check GROQ_API_KEY in Render")
+            raise RuntimeError(f"Groq {response.status_code} on {model}")
 
-            if response.status_code != 200:
-                print(
-                    f"[GROQ ERROR] model={model} status={response.status_code} body={response.text[:300]}",
-                    flush=True,
-                )
-                # 401 = bad key: no point trying other models
-                if response.status_code == 401:
-                    raise RuntimeError("Groq rejected the API key (401) — check GROQ_API_KEY in Render")
-                last_error = RuntimeError(f"Groq {response.status_code} on {model}")
-                continue
+        content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not content:
+            raise RuntimeError(f"Empty response from {model}")
+        return content
 
-            data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if content:
-                if model != GROQ_MODEL:
-                    print(f"[GROQ] primary model failed, answered using fallback model={model}", flush=True)
-                return content
+    # 1) the configured model
+    try:
+        tried.append(GROQ_MODEL)
+        return attempt(GROQ_MODEL)
+    except PermissionError:
+        raise
+    except Exception as e:
+        last_error = e
 
-            last_error = RuntimeError(f"Empty response from {model}")
-
-        except requests.exceptions.RequestException as e:
-            print(f"[GROQ ERROR] model={model} {type(e).__name__}: {e}", flush=True)
-            last_error = e
+    # 2) anything else Groq says this key can use
+    for model in _discover_groq_models():
+        if model in tried:
             continue
+        if len(tried) >= 4:
+            break
+        tried.append(model)
+        try:
+            content = attempt(model)
+            print(f"[GROQ] answered using model={model} (set GROQ_MODEL to this)", flush=True)
+            return content
+        except PermissionError:
+            raise
+        except Exception as e:
+            last_error = e
 
     raise last_error or RuntimeError("All Groq models failed")
 
 
 def call_ollama(prompt: str, system_prompt: str = "You are a helpful assistant.") -> str:
-    """Route requests to Groq when configured, otherwise fall back to local Ollama only in local development."""
+    """Route requests to Groq when configured, otherwise fall back to local Ollama only in local development.
+    (Name kept for backwards compatibility — it is the main LLM entry point.)"""
 
     provider = resolve_ai_provider()
 
@@ -424,7 +449,7 @@ def fetch_web_context(query: str, max_results: int = 5) -> str:
 
 
 def _clean_json_response(raw: str) -> str:
-    """Groq sometimes wraps its JSON reply in ```json ... ``` code fences
+    """The LLM sometimes wraps its JSON reply in ```json ... ``` code fences
     despite being told to return raw JSON only — strip that off before parsing,
     otherwise json.loads() fails and the whole draft silently gets lost."""
     text = (raw or "").strip()
@@ -577,9 +602,10 @@ def send_email(data):
         # arbitrary addresses, and sidesteps outbound SMTP port blocks on
         # free-tier hosts entirely.
         return (
-            f"✅ Email drafted and would be sent to {to} — real sending is "
-            f"disabled in this public demo. Clone the repo and run it "
-            f"locally to enable real sending."
+            f"📧 Demo mode: here's the email I would send to {to}.\n\n"
+            f"Subject: {subject}\n\n{body}\n\n"
+            f"Real sending is turned off on this public demo. "
+            f"Clone the repo and add your own Gmail credentials to .env to send for real."
         )
 
     try:
@@ -740,6 +766,69 @@ def get_stock(data):
         return f"Couldn't fetch stock price for {stock}: {e}"
 
 
+# STOCK COMPARISON (fetch several real prices, then let the LLM do the comparison)
+
+_COMPARISON_PATTERN = re.compile(
+    r"\b(more than|less than|compare|comparison|vs|versus|difference|higher|lower|cheaper|costlier|expensive|than)\b"
+)
+
+
+def _find_companies(command: str) -> list:
+    """Find every known company in the command, in the order they appear."""
+    lower = command.lower()
+    hits = []
+    for name in sorted(COMMON_TICKERS, key=len, reverse=True):
+        match = re.search(rf"\b{re.escape(name)}\b", lower)
+        if match:
+            hits.append((match.start(), COMMON_TICKERS[name]))
+            # blank out the match so a shorter name inside it ("tata" in "tata motors") isn't counted twice
+            lower = lower[:match.start()] + " " * (match.end() - match.start()) + lower[match.end():]
+
+    hits.sort(key=lambda h: h[0])
+    tickers = []
+    for _, ticker in hits:
+        if ticker not in tickers:
+            tickers.append(ticker)
+    return tickers
+
+
+def _is_stock_comparison(command: str) -> bool:
+    lower = command.lower()
+    mentions_price = any(w in lower for w in ("stock", "price", "share"))
+    wants_comparison = bool(_COMPARISON_PATTERN.search(lower))
+    return mentions_price and wants_comparison and len(_find_companies(command)) >= 2
+
+
+def answer_stock_comparison(command: str) -> str:
+    """Fetch each stock's real price, then let the LLM do the comparison."""
+    tickers = _find_companies(command)[:4]
+    quotes_text = "\n".join(get_stock({"stock_name": t}) for t in tickers)
+
+    prompt = f"""
+You are Ultron. Answer the user's comparison question using ONLY the live prices below.
+- Prices may be in different currencies (USD for US stocks, INR for NSE/BSE stocks).
+- Only do arithmetic if the currencies match. If they differ, state both prices and say
+  they're in different currencies, without inventing an exchange rate.
+- If a price is missing, say so plainly.
+- Be concise.
+
+Live prices:
+{quotes_text}
+
+User Command:
+"{command}"
+"""
+    answer = call_ollama(
+        prompt,
+        system_prompt="You are Ultron, a concise assistant that compares stock prices using only the data provided."
+    )
+
+    # If the LLM is down, still return the real prices instead of an error message
+    if "trouble reaching my AI service" in answer:
+        return quotes_text
+    return answer
+
+
 def execute_action(intent, action_data):
 
     if intent == "send_email":
@@ -782,8 +871,17 @@ def handle_message(req: MessageRequest, db: Session = Depends(get_db)):
             clear_pending_action(db, req.user_id)
             pending = None
 
-    # 1b. Normal message (or the pending draft was just dropped above)
-    if not pending:
+    # 1b. Stock comparison ("is apple more than reliance") — needs several prices + the LLM
+    compared = False
+    if not pending and _is_stock_comparison(req.command):
+        compared = True
+        intent = "get_stock"
+        action_data = {}
+        action_result = answer_stock_comparison(req.command)
+        response_text = action_result
+
+    # 1c. Normal message (or the pending draft was just dropped above)
+    if not pending and not compared:
         explicit_action = classify_action_request(req.command)
         if explicit_action:
             intent, action_data = explicit_action
@@ -809,7 +907,7 @@ def handle_message(req: MessageRequest, db: Session = Depends(get_db)):
 
             # Only send_email actually needs confirmation before running — weather
             # and stock lookups are read-only and safe to run immediately.
-            # Groq's own requires_confirmation field is unreliable (it sometimes
+            # The LLM's own requires_confirmation field is unreliable (it sometimes
             # sets it true for weather/stock too, despite the prompt telling it
             # not to), so this is enforced here in code rather than trusted from
             # the LLM's output.
