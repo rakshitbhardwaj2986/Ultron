@@ -39,8 +39,8 @@ GROQ_MODEL = (os.getenv("GROQ_MODEL") or "llama-3.3-70b-versatile").strip().stri
 # Groq rate limits are per-model, so a smaller model often still works when the 70B is capped.
 GROQ_FALLBACK_MODELS = [
     GROQ_MODEL,
-    "llama-3.1-8b-instant",
-    "llama3-70b-8192",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
 ]
 
 
@@ -136,11 +136,13 @@ def _call_groq(prompt: str, system_prompt: str) -> str:
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
-            "max_tokens": 600
+            "max_tokens": 2000,
         }
+        if "gpt-oss" in model:
+            payload["reasoning_effort"] = "low"
 
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=30)
