@@ -460,6 +460,25 @@ def _clean_json_response(raw: str) -> str:
     return text.strip()
 
 
+def _build_search_query(command: str, history: str) -> str:
+    """For short follow-ups ('what about tomorrow'), add the previous question
+    so the web search has enough context to return relevant results."""
+    lower = command.lower().strip()
+    words = lower.split()
+    follow_up_starts = ("what about", "and ", "how about", "why", "what", "where", "when", "who", "how")
+    pronouns = {"it", "that", "they", "he", "she", "this", "them", "there"}
+    is_short_followup = len(words) <= 6 and (
+        lower.startswith(follow_up_starts) or any(w.strip("?.,!") in pronouns for w in words)
+    )
+    if not history or not is_short_followup:
+        return command
+
+    last_user_lines = [l[6:] for l in history.splitlines() if l.startswith("User: ")]
+    if not last_user_lines:
+        return command
+    return f"{last_user_lines[-1]} {command}"
+
+
 def detect_intent(command: str, history: str = "") -> AIResponse:
 
     if _is_smalltalk(command):
@@ -538,7 +557,7 @@ User Command:
 
     web_context = ""
     if not _is_smalltalk(command):
-        web_context = fetch_web_context(command)
+        web_context = fetch_web_context(_build_search_query(command, history))
 
     prompt = f"""
 You are Ultron, a direct and helpful conversational assistant with access to live web search results below.
@@ -900,6 +919,7 @@ def handle_message(req: MessageRequest, db: Session = Depends(get_db)):
                     response_text = action_result
         else:
             history = get_recent_history(db, req.user_id)
+            print(f"[MEMORY] user_id={req.user_id} history_chars={len(history)}", flush=True)
             ai_result = detect_intent(req.command, history)
             intent = ai_result.intent
             response_text = ai_result.response
